@@ -29,7 +29,7 @@ jobs:
           --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
           enclave-rpc
     - name: Build app
-      run: go build
+      run: CGO_ENABLED=0 go build
     - name: Build EIF
       id: build-eif
       uses: richardfan1126/nitro-enclaves-eif-build-action@d33ccfaa2b1071e059c3c92c429508687dd2042c
