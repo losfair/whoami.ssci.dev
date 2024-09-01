@@ -224,8 +224,10 @@ func (s *Server) Handle(nConn net.Conn) {
 		}
 
 		channel.Write([]byte(strings.Replace(
-			fmt.Sprintf("Hello %s! Your client sent the following public keys:\n\n", si.User)+strings.Join(clientKeys, "")+"\n",
+			fmt.Sprintf("Hello %s! This is a demo application for SSCI (https://github.com/losfair/ssci).\n\nIt will echo the SSH public keys that your client uses to authenticate, but nobody except you can't see them - not even us.\n\nYour client sent the following public keys:\n\n", si.User)+strings.Join(clientKeys, "")+"\n",
 			"\n", "\n\r", -1)))
+
+		time.Sleep(3 * time.Second)
 		return
 	}
 }
