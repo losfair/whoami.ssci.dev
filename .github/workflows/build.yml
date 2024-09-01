@@ -1,0 +1,59 @@
+name: ci
+on:
+  push:
+
+jobs:
+  build-eif:
+    runs-on: ubuntu-22.04
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+    - name: Install cosign
+      uses: sigstore/cosign-installer@v3.6.0
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: "^1.23"
+    - name: Fetch and verify prebuilt enclave-rpc
+      run: |
+        set -e
+        mkdir enclave-rpc
+        cd enclave-rpc
+        wget -O enclave-rpc.tar.gz https://github.com/losfair/ssci/releases/download/v0.1.1/enclave-rpc-v0.1.1.tar.gz
+        tar -xzf enclave-rpc.tar.gz
+        cosign verify-blob --bundle enclave-rpc.bundle.json \
+          --certificate-identity-regexp '^https://github\.com/losfair/ssci/' \
+          --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+          enclave-rpc
+    - name: Build app
+      run: go build
+    - name: Build EIF
+      id: build-eif
+      uses: richardfan1126/nitro-enclaves-eif-build-action@d33ccfaa2b1071e059c3c92c429508687dd2042c
+      with:
+        docker-build-context-path: .
+        dockerfile-path: Dockerfile
+        eif-file-name: enclave.eif
+        eif-info-file-name: enclave-info.json
+    - name: Sign EIF
+      env:
+        EIF_FILE_PATH: ${{ steps.build-eif.outputs.eif-file-path }}
+        EIF_INFO_PATH: ${{ steps.build-eif.outputs.eif-info-path }}
+      run: |
+        set -e
+        mkdir build
+        cd build
+        cp "$EIF_FILE_PATH" enclave.eif
+        cp "$EIF_INFO_PATH" info.json
+        string_to_sign="$(jq -j .Measurements.PCR0 < info.json),$(jq -j .Measurements.PCR1 < info.json),$(jq -j .Measurements.PCR2 < info.json)"
+        echo "String to sign: $string_to_sign"
+        echo -n "$string_to_sign" | cosign sign-blob --yes --bundle signature.json -
+        cat signature.json
+    - name: Push binaries
+      uses: actions/upload-artifact@v4
+      with:
+        name: whoami-enclave
+        path: ./build

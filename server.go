@@ -1,76 +1,34 @@
 package main
 
 import (
-	"bytes"
-	"context"
-	"crypto/sha256"
+	"crypto/ed25519"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"strings"
 	"sync"
-	"text/template"
 	"time"
 
-	"crawshaw.io/sqlite/sqlitex"
-	"github.com/google/go-github/v42/github"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/oauth2"
-
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-var sshConns = promauto.NewCounterVec(prometheus.CounterOpts{Name: "ssh_connections_total"},
-	[]string{"agent", "x11", "roaming", "keyCount", "identified", "error"})
-var hsErrs = promauto.NewCounter(prometheus.CounterOpts{Name: "handshake_errors_total"})
-
 func main() {
-	metricsMux := http.NewServeMux()
-	metricsMux.Handle("/metrics", promhttp.Handler())
-	metricsServer := &http.Server{Addr: ":9091", Handler: metricsMux,
-		ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second}
-	go func() { log.Fatal(metricsServer.ListenAndServe()) }()
-
-	httpServer := &http.Server{Addr: ":8080",
-		Handler:     http.RedirectHandler("https://words.filippo.io/dispatches/whoami-updated/", 302),
-		ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second}
-	go func() { log.Fatal(httpServer.ListenAndServe()) }()
-
-	ts := oauth2.StaticTokenSource(
-		&oauth2.Token{AccessToken: os.Getenv("GITHUB_TOKEN")},
-	)
-	tc := oauth2.NewClient(context.Background(), ts)
-	ghClient := github.NewClient(tc)
-	_, _, err := ghClient.Users.Get(context.Background(), "")
-	fatalIfErr(err)
-	log.Println("Connected to GitHub...")
-
-	db, err := sqlitex.Open(os.Getenv("DB_PATH"), 0, 3)
-	fatalIfErr(err)
-	log.Println("Opened database...")
-
 	server := &Server{
-		githubClient: ghClient,
-		db:           db,
-		sessionInfo:  make(map[string]sessionInfo),
+		sessionInfo: make(map[string]sessionInfo),
 	}
 	server.sshConfig = &ssh.ServerConfig{
 		KeyboardInteractiveCallback: server.KeyboardInteractiveCallback,
 		PublicKeyCallback:           server.PublicKeyCallback,
 	}
 
-	private, err := ssh.ParsePrivateKey([]byte(os.Getenv("SSH_HOST_KEY")))
+	privKey, err := generateSSHPrivateKey()
 	fatalIfErr(err)
-	server.sshConfig.AddHostKey(private)
-	privateEd, err := ssh.ParsePrivateKey([]byte(os.Getenv("SSH_HOST_KEY_ED25519")))
-	fatalIfErr(err)
-	server.sshConfig.AddHostKey(privateEd)
+	server.sshConfig.AddHostKey(privKey)
 	log.Println("Loaded keys...")
 
 	listener, err := net.Listen("tcp", ":2222")
@@ -93,51 +51,6 @@ func fatalIfErr(err error) {
 		log.Fatal(err)
 	}
 }
-
-var termTmpl = template.Must(template.New("termTmpl").Parse(strings.Replace(`
-    +---------------------------------------------------------------------+
-    |                                                                     |
-    |             _o/ Hello {{ .Name }}!
-    |                                                                     |
-    |                                                                     |
-    |  Did you know that ssh sends all your public keys to any server     |
-    |  it tries to authenticate to?                                       |
-    |                                                                     |
-    |  We matched them to the keys of your GitHub account,                |
-    |  @{{ .User }}, which are available via the GraphQL API
-    |  and at https://github.com/{{ .User }}.keys
-    |                                                                     |
-    |  -- Filippo (https://filippo.io)                                    |
-    |                                                                     |
-    |                                                                     |
-    |  P.S. The source of this server is at                               |
-    |  https://github.com/FiloSottile/whoami.filippo.io                   |
-    |                                                                     |
-    +---------------------------------------------------------------------+
-
-`, "\n", "\n\r", -1)))
-
-var failedMsg = []byte(strings.Replace(`
-    +---------------------------------------------------------------------+
-    |                                                                     |
-    |             _o/ Hello!                                              |
-    |                                                                     |
-    |                                                                     |
-    |  Did you know that ssh sends all your public keys to any server     |
-    |  it tries to authenticate to? You can see yours echoed below.       |
-    |                                                                     |
-    |  We tried to use them to lookup your GitHub account,                |
-    |  but got no match :(                                                |
-    |                                                                     |
-    |  -- Filippo (https://filippo.io)                                    |
-    |                                                                     |
-    |                                                                     |
-    |  P.S. The source of this server is at                               |
-    |  https://github.com/FiloSottile/whoami.filippo.io                   |
-    |                                                                     |
-    +---------------------------------------------------------------------+
-
-`, "\n", "\n\r", -1))
 
 var agentMsg = []byte(strings.Replace(`
                       ***** WARNING ***** WARNING *****
@@ -187,9 +100,7 @@ type sessionInfo struct {
 }
 
 type Server struct {
-	githubClient *github.Client
-	sshConfig    *ssh.ServerConfig
-	db           *sqlitex.Pool
+	sshConfig *ssh.ServerConfig
 
 	mu          sync.RWMutex
 	sessionInfo map[string]sessionInfo
@@ -216,34 +127,20 @@ func (s *Server) KeyboardInteractiveCallback(ssh.ConnMetadata, ssh.KeyboardInter
 
 type logEntry struct {
 	Timestamp     string
-	Username      string   `json:",omitempty"`
-	RequestTypes  []string `json:",omitempty"`
-	Error         string   `json:",omitempty"`
-	KeysOffered   []string `json:",omitempty"`
-	GitHubID      int64    `json:",omitempty"`
-	GitHubName    string   `json:",omitempty"`
-	ClientVersion string   `json:",omitempty"`
+	Error         string `json:",omitempty"`
+	ClientVersion string `json:",omitempty"`
 }
 
 func (s *Server) Handle(nConn net.Conn) {
 	conn, chans, reqs, err := ssh.NewServerConn(nConn, s.sshConfig)
 	if err != nil {
 		// Port scan, health check, or dictionary attack.
-		hsErrs.Inc()
 		return
 	}
 	le := &logEntry{Timestamp: time.Now().Format(time.RFC3339)}
 	defer json.NewEncoder(os.Stdout).Encode(le)
 	var agentFwd, x11, roaming bool
 	defer func() {
-		sshConns.With(prometheus.Labels{
-			"keyCount":   fmt.Sprintf("%v", len(le.KeysOffered)),
-			"error":      fmt.Sprintf("%v", le.Error != ""),
-			"identified": fmt.Sprintf("%v", le.GitHubID != 0),
-			"agent":      fmt.Sprintf("%v", agentFwd),
-			"x11":        fmt.Sprintf("%v", x11),
-			"roaming":    fmt.Sprintf("%v", roaming),
-		}).Inc()
 		s.mu.Lock()
 		delete(s.sessionInfo, string(conn.SessionID()))
 		s.mu.Unlock()
@@ -252,7 +149,6 @@ func (s *Server) Handle(nConn net.Conn) {
 	}()
 	go func(in <-chan *ssh.Request) {
 		for req := range in {
-			le.RequestTypes = append(le.RequestTypes, req.Type)
 			if req.Type == "roaming@appgate.com" {
 				roaming = true
 			}
@@ -266,11 +162,7 @@ func (s *Server) Handle(nConn net.Conn) {
 	si := s.sessionInfo[string(conn.SessionID())]
 	s.mu.RUnlock()
 
-	le.Username = conn.User()
 	le.ClientVersion = string(conn.ClientVersion())
-	for _, key := range si.Keys {
-		le.KeysOffered = append(le.KeysOffered, string(ssh.MarshalAuthorizedKey(key)))
-	}
 
 	for newChannel := range chans {
 		if newChannel.ChannelType() != "session" {
@@ -290,7 +182,6 @@ func (s *Server) Handle(nConn net.Conn) {
 
 		go func(in <-chan *ssh.Request) {
 			for req := range in {
-				le.RequestTypes = append(le.RequestTypes, req.Type)
 				ok := false
 				switch req.Type {
 				case "shell":
@@ -327,60 +218,41 @@ func (s *Server) Handle(nConn net.Conn) {
 			channel.Write(roamingMsg)
 		}
 
-		userID, err := s.findUser(si.Keys)
-		if err != nil {
-			le.Error = "findUser failed: " + err.Error()
-			return
+		var clientKeys []string
+		for _, key := range si.Keys {
+			clientKeys = append(clientKeys, string(ssh.MarshalAuthorizedKey(key)))
 		}
 
-		if userID == 0 {
-			channel.Write(failedMsg)
-			for _, key := range si.Keys {
-				channel.Write(ssh.MarshalAuthorizedKey(key))
-				channel.Write([]byte("\r"))
-			}
-			channel.Write([]byte("\n\r"))
-			return
-		}
-
-		le.GitHubID = userID
-		u, _, err := s.githubClient.Users.GetByID(context.TODO(), userID)
-		if err != nil {
-			le.Error = "getUserName failed: " + err.Error()
-			return
-		}
-
-		login := *u.Login
-		le.GitHubName = *u.Login
-		name := "@" + login
-		if u.Name != nil {
-			name = *u.Name
-		}
-
-		termTmpl.Execute(channel, struct{ Name, User string }{name, login})
+		channel.Write([]byte(strings.Replace(
+			fmt.Sprintf("Hello %s! Your client sent the following public keys:\n\n", si.User)+strings.Join(clientKeys, "")+"\n",
+			"\n", "\n\r", -1)))
 		return
 	}
 }
 
-func (s *Server) findUser(keys []ssh.PublicKey) (int64, error) {
-	conn := s.db.Get(context.TODO())
-	if conn == nil {
-		return 0, errors.New("couldn't get db connection")
-	}
-	defer s.db.Put(conn)
-	for _, pk := range keys {
-		key := bytes.TrimSpace(ssh.MarshalAuthorizedKey(pk))
-		keyHash := sha256.Sum256(key)
-		stmt := conn.Prep("SELECT userID FROM key_userid WHERE keyHash = $kh;")
-		stmt.SetBytes("$kh", keyHash[:16])
-		if hasRow, err := stmt.Step(); err != nil {
-			return 0, err
-		} else if !hasRow {
-			continue
-		}
-		defer stmt.Reset()
-		return stmt.GetInt64("userID"), nil
+func generateSSHPrivateKey() (sshPriv ssh.Signer, err error) {
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		return sshPriv, err
 	}
 
-	return 0, nil
+	bytes, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		return sshPriv, err
+	}
+
+	privatePem := pem.EncodeToMemory(
+		&pem.Block{
+			Type:  "PRIVATE KEY",
+			Bytes: bytes,
+		},
+	)
+
+	sshPriv, err = ssh.ParsePrivateKey(privatePem)
+	if err != nil {
+		return sshPriv, err
+	}
+
+	return sshPriv, nil
+
 }

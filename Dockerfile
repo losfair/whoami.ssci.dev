@@ -1,15 +1,11 @@
-FROM golang:1.19-alpine3.16 AS builder
+FROM debian:bullseye
 
-RUN apk add --no-cache build-base
+RUN apt-get update && apt-get install -y openssh-server net-tools htop curl && \
+    useradd -p '*' -u 1000 user && mkdir -p /home/user/.ssh && chown -R user:user /home/user
 
-COPY *.go go.mod go.sum src
-WORKDIR src
-RUN go install -trimpath
+COPY ./sshd_config /opt/sshd/sshd_config
+COPY --chmod=755 ./enclave-rpc/enclave-rpc /
+COPY --chmod=755 ./start.sh /
+COPY --chmod=755 ./whoami.ssci.dev /
 
-FROM alpine:3.16
-
-COPY --from=builder /go/bin/whoami.filippo.io /usr/local/bin/
-COPY whoami.sqlite3 /usr/local/share/
-ENV DB_PATH /usr/local/share/whoami.sqlite3
-
-ENTRYPOINT ["whoami.filippo.io"]
+CMD ["/start.sh"]

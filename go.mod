@@ -1,4 +1,4 @@
-module github.com/FiloSottile/whoami.filippo.io
+module github.com/losfair/whoami.ssci.dev
 
 go 1.19
 
